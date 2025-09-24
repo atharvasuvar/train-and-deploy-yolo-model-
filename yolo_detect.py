@@ -46,7 +46,7 @@ print(f"[INFO] Classes in model: {labels}")
 # ==========================
 port = "COM9"  # Change this to your correct COM port
 try:
-    board = pyfirmata.Arduino(port)
+    board = pyfirmata.Arduino('COM9', baudrate=57600)
     servo_pinX = board.get_pin('d:9:s')   # Servo X on pin 9
     servo_pinY = board.get_pin('d:10:s')  # Servo Y on pin 10
     print("[INFO] Arduino connected successfully!")

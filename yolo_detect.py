@@ -4,11 +4,12 @@ import time
 import numpy as np
 import argparse
 from ultralytics import YOLO
+import pyfirmata
 
 # ==========================
 # ARGUMENT PARSER
 # ==========================
-parser = argparse.ArgumentParser(description="Knife & Gun Detection with YOLO")
+parser = argparse.ArgumentParser(description="Knife, Gun & Face Detection with Tracking (YOLO + Arduino)")
 parser.add_argument("--model", type=str, default="runs/detect/train/weights/best.pt",
                     help="Path to your trained YOLO model (best.pt)")
 parser.add_argument("--source", type=str, default="0",
@@ -41,14 +42,33 @@ labels = model.names  # Example: {0: 'gun', 1: 'knife'}
 print(f"[INFO] Classes in model: {labels}")
 
 # ==========================
+# Arduino Setup for Servo
+# ==========================
+port = "COM9"  # Change this to your correct COM port
+try:
+    board = pyfirmata.Arduino(port)
+    servo_pinX = board.get_pin('d:9:s')   # Servo X on pin 9
+    servo_pinY = board.get_pin('d:10:s')  # Servo Y on pin 10
+    print("[INFO] Arduino connected successfully!")
+except:
+    print("[ERROR] Unable to connect to Arduino on COM9. Check connection.")
+    board = None
+    servo_pinX = None
+    servo_pinY = None
+
+servoPos = [90, 90]  # Initial servo position
+
+# ==========================
 # DETERMINE SOURCE TYPE
 # ==========================
 image_extensions = ['.jpg', '.jpeg', '.png', '.bmp']
 video_extensions = ['.mp4', '.avi', '.mov', '.mkv']
 
-# If user enters '0', use webcam
 if SOURCE == "0":
     SOURCE = 0
+    source_type = 'webcam'
+elif SOURCE.startswith("usb"):
+    SOURCE = int(SOURCE[3:])
     source_type = 'webcam'
 elif os.path.isdir(SOURCE):
     source_type = 'folder'
@@ -78,6 +98,12 @@ else:
 colors = {'gun': (0, 0, 255), 'knife': (255, 0, 0)}  # Red = Gun, Blue = Knife
 fps_buffer = []
 fps_avg_len = 30
+ws, hs = RESOLUTION  # Camera resolution
+
+# ==========================
+# FACE DETECTION (Haar Cascade)
+# ==========================
+face_cascade = cv2.CascadeClassifier("haarcascade_frontalface_default.xml")
 
 # ==========================
 # PROCESS FRAME FUNCTION
@@ -86,13 +112,14 @@ def process_frame(frame):
     results = model(frame, verbose=False)[0]
     detections = results.boxes
     object_count = {'gun': 0, 'knife': 0}
+    face_coords = None  # Will store the center of detected face
 
+    # ---------- YOLO Object Detection ----------
     for box in detections:
         cls_id = int(box.cls.item())
         label = labels[cls_id].lower()
         conf = float(box.conf.item())
 
-        # Only detect gun or knife
         if label not in ['gun', 'knife']:
             continue
 
@@ -102,7 +129,7 @@ def process_frame(frame):
         # Get bounding box
         x1, y1, x2, y2 = map(int, box.xyxy.cpu().numpy().squeeze())
 
-        # Draw box and label
+        # Draw bounding box
         color = colors[label]
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         cv2.putText(frame, f"{label}: {int(conf * 100)}%", (x1, y1 - 10),
@@ -111,7 +138,39 @@ def process_frame(frame):
         # Count detections
         object_count[label] += 1
 
-    return frame, object_count
+    # ---------- Face Detection for Tracking ----------
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=3)
+
+    if len(faces) > 0:
+        (x, y, w, h) = faces[0]  # Track the first detected face
+        fx, fy = x + w // 2, y + h // 2
+        face_coords = (fx, fy)
+
+        # Draw rectangle and crosshair
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        cv2.line(frame, (0, fy), (ws, fy), (0, 0, 0), 2)
+        cv2.line(frame, (fx, hs), (fx, 0), (0, 0, 0), 2)
+        cv2.putText(frame, "TARGET LOCKED", (450, 50), cv2.FONT_HERSHEY_PLAIN, 2, (255, 0, 255), 2)
+
+        # Servo control mapping
+        servoX = np.interp(fx, [0, ws], [180, 0])
+        servoY = np.interp(fy, [0, hs], [180, 0])
+        servoX = max(0, min(180, servoX))
+        servoY = max(0, min(180, servoY))
+
+        servoPos[0] = servoX
+        servoPos[1] = servoY
+
+        # Send positions to Arduino
+        if servo_pinX and servo_pinY:
+            servo_pinX.write(servoX)
+            servo_pinY.write(servoY)
+
+    else:
+        cv2.putText(frame, "NO TARGET", (450, 50), cv2.FONT_HERSHEY_PLAIN, 2, (0, 0, 255), 2)
+
+    return frame, object_count, face_coords
 
 # ==========================
 # MAIN LOOP
@@ -125,7 +184,7 @@ if source_type in ['video', 'webcam']:
             break
 
         start_time = time.perf_counter()
-        frame, counts = process_frame(frame)
+        frame, counts, face_coords = process_frame(frame)
         end_time = time.perf_counter()
 
         # Calculate FPS
@@ -143,8 +202,12 @@ if source_type in ['video', 'webcam']:
         cv2.putText(frame, f"Guns: {counts['gun']} Knives: {counts['knife']}",
                     (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
+        # Display servo positions
+        cv2.putText(frame, f'Servo X: {int(servoPos[0])} deg', (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+        cv2.putText(frame, f'Servo Y: {int(servoPos[1])} deg', (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+
         # Show window
-        cv2.imshow("Knife & Gun Detection", frame)
+        cv2.imshow("YOLO + Face Tracking", frame)
 
         if RECORD:
             out.write(frame)
@@ -166,12 +229,12 @@ elif source_type == 'folder':
 
         img_path = os.path.join(SOURCE, img_name)
         frame = cv2.imread(img_path)
-        frame, counts = process_frame(frame)
+        frame, counts, _ = process_frame(frame)
 
         cv2.putText(frame, f"Guns: {counts['gun']} Knives: {counts['knife']}",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-        cv2.imshow("Knife & Gun Detection", frame)
+        cv2.imshow("YOLO + Face Tracking", frame)
         cv2.waitKey(0)
 
     cv2.destroyAllWindows()
@@ -179,11 +242,11 @@ elif source_type == 'folder':
 elif source_type == 'image':
     print(f"[INFO] Processing single image: {SOURCE}")
     frame = cv2.imread(SOURCE)
-    frame, counts = process_frame(frame)
+    frame, counts, _ = process_frame(frame)
 
     cv2.putText(frame, f"Guns: {counts['gun']} Knives: {counts['knife']}",
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-    cv2.imshow("Knife & Gun Detection", frame)
+    cv2.imshow("YOLO + Face Tracking", frame)
     cv2.waitKey(0)
     cv2.destroyAllWindows()

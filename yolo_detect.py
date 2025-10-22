@@ -9,57 +9,76 @@ import pyfirmata
 # ==========================
 # ARGUMENT PARSER
 # ==========================
-parser = argparse.ArgumentParser(description="Knife, Gun & Face Detection with Tracking (YOLO + Arduino)")
-parser.add_argument("--model", type=str, default="runs/detect/train/weights/best.pt",
-                    help="Path to your trained YOLO model (best.pt)")
+parser = argparse.ArgumentParser(description="Weapon & Mask Threat Detection (YOLO + Arduino)")
+parser.add_argument("--weapon_model", type=str, default="runs/detect/train/weights/best.pt",
+                    help="Path to your trained weapon YOLO model")
+parser.add_argument("--mask_model", type=str, default="runs/detect/mask/weights/best.pt",
+                    help="Path to your trained mask YOLO model")
 parser.add_argument("--source", type=str, default="0",
                     help="Source: 0 for webcam, video file path, or image folder path")
 parser.add_argument("--conf", type=float, default=0.5, help="Confidence threshold")
 parser.add_argument("--record", action="store_true", help="Enable video recording")
-parser.add_argument("--output", type=str, default="knife_gun_detection.avi", help="Output video file name")
+parser.add_argument("--output", type=str, default="output.avi", help="Output video file name")
 args = parser.parse_args()
 
 # ==========================
 # CONFIGURATION
 # ==========================
-MODEL_PATH = args.model
+WEAPON_MODEL_PATH = args.weapon_model
+MASK_MODEL_PATH = args.mask_model
 CONF_THRESHOLD = args.conf
 SOURCE = args.source
 RECORD = args.record
 RECORD_NAME = args.output
-RESOLUTION = (640, 480)  # Width x Height
+RESOLUTION = (640, 480)
 
 # ==========================
-# VERIFY MODEL PATH
+# VERIFY MODEL PATHS
 # ==========================
-if not os.path.exists(MODEL_PATH):
-    raise FileNotFoundError(f"[ERROR] Model not found at {MODEL_PATH}. "
-                            f"Please provide the correct path using --model argument.")
+if not os.path.exists(WEAPON_MODEL_PATH):
+    raise FileNotFoundError(f"[ERROR] Weapon model not found at {WEAPON_MODEL_PATH}.")
+if not os.path.exists(MASK_MODEL_PATH):
+    raise FileNotFoundError(f"[ERROR] Mask model not found at {MASK_MODEL_PATH}.")
 
-print(f"[INFO] Loading YOLO model from: {MODEL_PATH}")
-model = YOLO(MODEL_PATH)
-labels = model.names  # Example: {0: 'gun', 1: 'knife'}
-print(f"[INFO] Classes in model: {labels}")
-
-# ==========================
-# Arduino Setup for Servo
-# ==========================
-port = "COM9"  # Change this to your correct COM port
+print(f"[INFO] Loading Weapon Model: {WEAPON_MODEL_PATH}")
+weapon_model = YOLO(WEAPON_MODEL_PATH)
+weapon_labels = weapon_model.names
+weapon_model.fuse()
 try:
-    board = pyfirmata.Arduino('COM9', baudrate=57600)
-    servo_pinX = board.get_pin('d:9:s')   # Servo X on pin 9
-    servo_pinY = board.get_pin('d:10:s')  # Servo Y on pin 10
+    weapon_model.to('cuda')
+    print("[INFO] Weapon model on CUDA")
+except:
+    print("[INFO] Weapon model on CPU")
+
+print(f"[INFO] Loading Mask Model: {MASK_MODEL_PATH}")
+mask_model = YOLO(MASK_MODEL_PATH)
+mask_labels = mask_model.names
+mask_model.fuse()
+try:
+    mask_model.to('cuda')
+    print("[INFO] Mask model on CUDA")
+except:
+    print("[INFO] Mask model on CPU")
+
+# ==========================
+# Arduino Setup
+# ==========================
+port = "COM9"
+try:
+    board = pyfirmata.Arduino(port, baudrate=57600)
+    servo_pinX = board.get_pin('d:9:s')
+    servo_pinY = board.get_pin('d:10:s')
     print("[INFO] Arduino connected successfully!")
 except:
-    print("[ERROR] Unable to connect to Arduino on COM9. Check connection.")
+    print(f"[ERROR] Unable to connect to Arduino on {port}. Check connection.")
     board = None
     servo_pinX = None
     servo_pinY = None
 
-servoPos = [90, 90]  # Initial servo position
+servoPos = [90, 90]
 
 # ==========================
-# DETERMINE SOURCE TYPE
+# SOURCE TYPE
 # ==========================
 image_extensions = ['.jpg', '.jpeg', '.png', '.bmp']
 video_extensions = ['.mp4', '.avi', '.mov', '.mkv']
@@ -76,101 +95,94 @@ elif os.path.isfile(SOURCE):
     ext = os.path.splitext(SOURCE)[1].lower()
     source_type = 'video' if ext in video_extensions else 'image'
 else:
-    raise ValueError("[ERROR] Invalid SOURCE. Use webcam index (0), image folder path, or video file path.")
+    raise ValueError("[ERROR] Invalid SOURCE.")
 
 # ==========================
 # SETUP VIDEO CAPTURE
 # ==========================
 if source_type in ['video', 'webcam']:
     cap = cv2.VideoCapture(SOURCE)
-    cap.set(3, RESOLUTION[0])
-    cap.set(4, RESOLUTION[1])
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, RESOLUTION[0])
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, RESOLUTION[1])
+    cap.set(cv2.CAP_PROP_FPS, 60)
 
     if RECORD:
         fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-        out = cv2.VideoWriter(RECORD_NAME, fourcc, 30, RESOLUTION)
+        out = cv2.VideoWriter(RECORD_NAME, fourcc, 60, RESOLUTION)
 else:
     cap = None
 
 # ==========================
-# COLORS & VARIABLES
+# COLORS
 # ==========================
-colors = {'gun': (0, 0, 255), 'knife': (255, 0, 0)}  # Red = Gun, Blue = Knife
+weapon_colors = {'gun': (0, 0, 255), 'knife': (0, 165, 255)}  # Gun=red, Knife=orange
+face_colors = {'threat': (0, 0, 255), 'safe': (0, 255, 0)}    # Threat=red, Safe=green
 fps_buffer = []
 fps_avg_len = 30
-ws, hs = RESOLUTION  # Camera resolution
-
-# ==========================
-# FACE DETECTION (Haar Cascade)
-# ==========================
-face_cascade = cv2.CascadeClassifier("haarcascade_frontalface_default.xml")
+ws, hs = RESOLUTION
 
 # ==========================
 # PROCESS FRAME FUNCTION
 # ==========================
 def process_frame(frame):
-    results = model(frame, verbose=False)[0]
-    detections = results.boxes
-    object_count = {'gun': 0, 'knife': 0}
-    face_coords = None  # Will store the center of detected face
+    # ========== Weapon Detection ==========
+    weapon_results = weapon_model(frame, verbose=False, imgsz=640)[0]
+    detections = weapon_results.boxes
+    weapon_count = {'gun': 0, 'knife': 0}
 
-    # ---------- YOLO Object Detection ----------
     for box in detections:
         cls_id = int(box.cls.item())
-        label = labels[cls_id].lower()
+        label = weapon_labels[cls_id].lower()
         conf = float(box.conf.item())
-
-        if label not in ['gun', 'knife']:
+        if label not in ['gun', 'knife'] or conf < CONF_THRESHOLD:
             continue
+        x1, y1, x2, y2 = map(int, box.xyxy.cpu().numpy().squeeze())
+        color = weapon_colors[label]
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+        cv2.putText(frame, f"{label.upper()} {int(conf*100)}%", (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        weapon_count[label] += 1
 
+    # ========== Mask Detection ==========
+    mask_results = mask_model(frame, verbose=False, imgsz=640)[0]
+    mask_boxes = mask_results.boxes
+    threat_count = 0
+    safe_count = 0
+
+    for box in mask_boxes:
+        cls_id = int(box.cls.item())
+        label = mask_labels[cls_id].lower()
+        conf = float(box.conf.item())
         if conf < CONF_THRESHOLD:
             continue
 
-        # Get bounding box
         x1, y1, x2, y2 = map(int, box.xyxy.cpu().numpy().squeeze())
 
-        # Draw bounding box
-        color = colors[label]
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(frame, f"{label}: {int(conf * 100)}%", (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        # Assuming your mask model labels:
+        # 'mask' = threat (covered face), 'no_mask' = safe (uncovered)
+        if 'mask' in label or 'cover' in label:
+            color = face_colors['threat']
+            text = "THREAT"
+            threat_count += 1
+        else:
+            color = face_colors['safe']
+            text = "SAFE"
+            safe_count += 1
 
-        # Count detections
-        object_count[label] += 1
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+        cv2.putText(frame, f"{text} {int(conf*100)}%", (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-    # ---------- Face Detection for Tracking ----------
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=3)
-
-    if len(faces) > 0:
-        (x, y, w, h) = faces[0]  # Track the first detected face
-        fx, fy = x + w // 2, y + h // 2
-        face_coords = (fx, fy)
-
-        # Draw rectangle and crosshair
-        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-        cv2.line(frame, (0, fy), (ws, fy), (0, 0, 0), 2)
-        cv2.line(frame, (fx, hs), (fx, 0), (0, 0, 0), 2)
-        cv2.putText(frame, "TARGET LOCKED", (450, 50), cv2.FONT_HERSHEY_PLAIN, 2, (255, 0, 255), 2)
-
-        # Servo control mapping
+        # Servo Tracking (optional — track first face)
+        fx, fy = (x1 + x2) // 2, (y1 + y2) // 2
         servoX = np.interp(fx, [0, ws], [180, 0])
         servoY = np.interp(fy, [0, hs], [180, 0])
-        servoX = max(0, min(180, servoX))
-        servoY = max(0, min(180, servoY))
-
-        servoPos[0] = servoX
-        servoPos[1] = servoY
-
-        # Send positions to Arduino
+        servoPos[0], servoPos[1] = servoX, servoY
         if servo_pinX and servo_pinY:
             servo_pinX.write(servoX)
             servo_pinY.write(servoY)
 
-    else:
-        cv2.putText(frame, "NO TARGET", (450, 50), cv2.FONT_HERSHEY_PLAIN, 2, (0, 0, 255), 2)
-
-    return frame, object_count, face_coords
+    return frame, weapon_count, threat_count, safe_count
 
 # ==========================
 # MAIN LOOP
@@ -184,35 +196,31 @@ if source_type in ['video', 'webcam']:
             break
 
         start_time = time.perf_counter()
-        frame, counts, face_coords = process_frame(frame)
+        frame, weapon_counts, threat_count, safe_count = process_frame(frame)
         end_time = time.perf_counter()
 
-        # Calculate FPS
         fps = 1 / (end_time - start_time)
         fps_buffer.append(fps)
         if len(fps_buffer) > fps_avg_len:
             fps_buffer.pop(0)
         avg_fps = np.mean(fps_buffer)
 
-        # Display FPS
         cv2.putText(frame, f"FPS: {avg_fps:.2f}", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-        # Display object counts
-        cv2.putText(frame, f"Guns: {counts['gun']} Knives: {counts['knife']}",
+        cv2.putText(frame, f"Guns: {weapon_counts['gun']} Knives: {weapon_counts['knife']}",
                     (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-        # Display servo positions
-        cv2.putText(frame, f'Servo X: {int(servoPos[0])} deg', (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-        cv2.putText(frame, f'Servo Y: {int(servoPos[1])} deg', (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+        cv2.putText(frame, f"THREAT: {threat_count}  SAFE: {safe_count}",
+                    (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
-        # Show window
-        cv2.imshow("YOLO + Face Tracking", frame)
+        cv2.putText(frame, f'Servo X: {int(servoPos[0])} Y: {int(servoPos[1])}', (10, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
 
+        cv2.imshow("YOLO - Weapon & Mask Threat Detection", frame)
         if RECORD:
             out.write(frame)
 
-        # Quit on 'q'
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
@@ -226,27 +234,25 @@ elif source_type == 'folder':
     for img_name in os.listdir(SOURCE):
         if os.path.splitext(img_name)[1].lower() not in image_extensions:
             continue
-
         img_path = os.path.join(SOURCE, img_name)
         frame = cv2.imread(img_path)
-        frame, counts, _ = process_frame(frame)
-
-        cv2.putText(frame, f"Guns: {counts['gun']} Knives: {counts['knife']}",
+        frame, weapon_counts, threat_count, safe_count = process_frame(frame)
+        cv2.putText(frame, f"Guns: {weapon_counts['gun']} Knives: {weapon_counts['knife']}",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-        cv2.imshow("YOLO + Face Tracking", frame)
+        cv2.putText(frame, f"THREAT: {threat_count}  SAFE: {safe_count}",
+                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        cv2.imshow("YOLO - Weapon & Mask Threat Detection", frame)
         cv2.waitKey(0)
-
     cv2.destroyAllWindows()
 
 elif source_type == 'image':
     print(f"[INFO] Processing single image: {SOURCE}")
     frame = cv2.imread(SOURCE)
-    frame, counts, _ = process_frame(frame)
-
-    cv2.putText(frame, f"Guns: {counts['gun']} Knives: {counts['knife']}",
+    frame, weapon_counts, threat_count, safe_count = process_frame(frame)
+    cv2.putText(frame, f"Guns: {weapon_counts['gun']} Knives: {weapon_counts['knife']}",
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-    cv2.imshow("YOLO + Face Tracking", frame)
+    cv2.putText(frame, f"THREAT: {threat_count}  SAFE: {safe_count}",
+                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+    cv2.imshow("YOLO - Weapon & Mask Threat Detection", frame)
     cv2.waitKey(0)
     cv2.destroyAllWindows()

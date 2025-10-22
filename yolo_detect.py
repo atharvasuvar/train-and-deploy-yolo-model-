@@ -33,7 +33,7 @@ model = YOLO(MODEL_PATH)
 labels = model.names
 
 # ========================== ARDUINO SETUP ==========================
-port = "COM9"
+port = "COM7"
 try:
     board = pyfirmata.Arduino(port, baudrate=57600)
     servo_pinX = board.get_pin('d:9:s')
